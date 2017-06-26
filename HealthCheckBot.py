@@ -1,5 +1,5 @@
 #requires installation of
-#   python3, SlackClient Extensions, hashlib, requests
+#   python3, SlackClient Extensions, requests, _thread, datetime, os, time
 
 import os
 import time
