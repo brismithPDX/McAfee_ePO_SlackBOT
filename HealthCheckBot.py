@@ -1,147 +1,278 @@
 #requires installation of
-#   python3, SlackClient Extensions, requests, _thread, datetime, os, time
-
+#   python3, SlackClient Extensions, hashlib, requests
 import os
 import time
 from datetime import datetime
-from slackclient import SlackClient
+import slack
 import requests
 from requests.auth import HTTPBasicAuth
 import _thread
+import json
+import re
+
+# Disables 'InsecureRequestWarning' warning from urllib3
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
-##Control variables and Global Defaults
+## Control variables, Global Defaults, and Configuration ##
 DEBUG = 0
 MaxCommandLen = 10
-BOT_NAME = "ePO_BOT"
+#Bot Configuration
+BOT_NAME = ""
 Default_Channel = ""
 BOT_ID = ''
-SLACK_BOT_TOKEN = ''
 
-ePO_SERVER_usr = ""
-ePO_SERVER_pass = ""
-ServerLocation = "https://your_ePO_server.local:8443"
+#ePO Connection Configuration
+infection_search_window = 3888000000
+webclient = None 
+
+vers_dict = {}
+regex = re.compile(r'Builder Number: (\d*)')
+
+# Access EPO credentials and Slackbot Token
+# Credential format is: EPO_Username\nEPO_Password\nSlackToken
+with open("credentials.txt", 'r') as cred_file:
+    CROMWELL_usr = cred_file.readline().strip()
+    CROMWELL_pass = cred_file.readline().strip()
+    SLACK_BOT_TOKEN = cred_file.readline().strip()
+
+# Dictionary of Microsoft OS Build # : Version Info
+# Built using ms_buildvers_scraper.py
+with open("winvers.json", "r") as vers_file:
+    vers_dict = json.load(vers_file)
+
+with open('mcafee_latest_versions.json', 'r') as mcafee_vers_file:
+    mcafee_vers_dict = json.load(mcafee_vers_file)
+
+#logFile Configuration
+ErrorFile = ".\OperationLogs\ErrorLog.log"
+AuditFile = ".\OperationLogs\AuditLog.log"
+
 
 AT_BOT = "<@" + BOT_ID + ">"
+## End of Configuration, Control Variables, and Global Defaults##
 
 ##Begin Bot Operations
+slack_client = slack.RTMClient(token=SLACK_BOT_TOKEN)
 
-slack_client = SlackClient(SLACK_BOT_TOKEN)
 
 #Core BOT Functions
-def parse_slack_output(slack_rtm_output):   #Slack channel parser: DO NOT EDIT
-    output_list = slack_rtm_output
-    if output_list and len(output_list) > 0:
-        for output in output_list:
-            if output and 'text' in output and AT_BOT in output['text']:
-                # return text after the @ mention, whitespace removed
-                return output['text'].split(AT_BOT)[1].strip().lower(), \
-                       output['channel']
-    return None, None
+@slack_client.run_on(event='message')
+def parse_slack_output(**slack_rtm_output):   #Slack channel parser
+    if slack_rtm_output and len(slack_rtm_output) > 0:
 
-def display_help(channel, usr_args):        #Displays help in requested channel
+        data = slack_rtm_output['data']
+
+        global webclient
+        webclient = slack_rtm_output['web_client']
+
+        try:
+            if AT_BOT in data['text']:
+                # return text after the @ mention, whitespace removed
+                command, channel = data['text'].split(AT_BOT)[1].strip().lower(), data['channel']
+                try:
+                    _thread.start_new_thread(command_dict[command[:MaxCommandLen]], (channel,  command[MaxCommandLen: MaxCommandLen+15]))
+                except:
+                    response = "Sorry I am not familiar with that command, type help for avilable commands."
+                    webclient.chat_postMessage(channel=channel, text=response, as_user=True) 
+        except Exception as inst:
+            if DEBUG == 1:
+                log_ToFile("Exception instance encountered: " + inst, "Error")
+
+
+#Displays help in requested channel
+def display_help(channel, usr_args):
     response = """ Hi, I am """ + BOT_NAME + "!" + """
     I am here to help technicans check a computers McAfee Health Status.
     I accept commands in the \""""+ BOT_NAME + """ [Command]\" format.
 
-    Right now i can only do a few things but they include:
+    Right now I can only do a few things but they include:
     getupdate - has me run a on demand update check
-    help - prints this help page
-    ? - see "help"
+    help or ? - prints this help page
     namecheck [computer-name] - has me run a McAfee ePO health check on the client located on [computer-name] Note: computername must be 15chars or less.
     """
-    slack_client.api_call("chat.postMessage", channel=channel, text=response, as_user=True)
+    webclient.chat_postMessage(channel=channel, text=response, as_user=True)
+
 
 def mac_healthchk(response):                #Evaluates OSX Health check data
-    if response.find("On-Access Scan Enabled: true") != -1 and response.find("Managed State: true") != -1 and response.find("AMCore Content Compliance Status: true") != -1:
+    if response.find("On-Access Scan Enabled: true") != -1 and response.find("Definitions Up To Date (AMCore Content): true") != -1:
         final_response = "== Health Check PASSED ==" + response
     else:
         final_response = "== Health Check FAILED ==" + response
     return final_response
+
+
 def win_healthchk(response):                #Evaluates Windows Health check data
-    if response.find("false") == -1 and response.find("AMCore Content Compliance Status: true") != -1:
+    if response.find("false") == -1 and response.find("Definitions Up To Date (AMCore Content): true") != -1:
         final_response = "== Health Check PASSED ==" + response
     else:
         final_response = "== Health Check FAILED ==" + response
     return final_response
-def run_namecheck(channel, usr_args):       #Launches a McAfee health check for user define computer name 
+
+
+def InfectionHistory(usr_args):
+    #perform search on ePO server
+    hostname = ''
+    url = hostname + '/core.executeQuery?target=EPOEvents&select=(select EPOEvents.DetectedUTC EPOEvents.EventTimeLocal EPOEvents.TargetHostName EPOEvents.ThreatName)&where=(where ( and ( newerThan EPOEvents.DetectedUTC '+ str(infection_search_window) +'   ) ( or ( threatcategory_belongs EPOEvents.ThreatCategory "av"  ) ( threatcategory_belongs EPOEvents.ThreatCategory "av.detect"  ) ( threatcategory_belongs EPOEvents.ThreatCategory "av.detect.heuristics"  ) ( threatcategory_belongs EPOEvents.ThreatCategory "av.detect.heuristics"  )  ) ( eq EPOEvents.AnalyzerHostName "'+ usr_args +'"  )  ) )'
+    query_result = requests.get(url, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
+    
+    if DEBUG == 1:
+        count = query_result.text.count("E")
+        print("\n\nquery result count = " + str(count) + "\n\n")
+        print("Query Text = "+query_result.text+"\n\n===\n\n")
+    if(query_result.text.count("E") > 2):    
+        return True
+    else:
+        return False
+
+
+#Launches a McAfee health check for user define computer name 
+def run_namecheck(channel, usr_args):
+    hostname = ''
     #give user search launch notice
     response = "Starting a McAfee ePO Client Health Check, please be patient..."
-    slack_client.api_call("chat.postMessage", channel=channel, text=response, as_user=True)
+    webclient.chat_postMessage(channel=channel, text=response, as_user=True)
 
-    #perform search on ePO server
-    url = ServerLocation + '/remote/core.executeQuery?target=EPOLeafNode&select=(select AM_CustomProps.AVCMGRbComplianceStatus EPOLeafNode.NodeName EPOComputerProperties.OSType EPOLeafNode.LastUpdate EPOLeafNode.ManagedState AM_CustomProps.bAPEnabled AM_CustomProps.bOASEnabled)&where=(where(eq+EPOLeafNode.NodeName "' + usr_args + '"))'
-    query_result = requests.get(url, auth=HTTPBasicAuth(ePO_SERVER_usr,ePO_SERVER_pass = ""), verify=False)
+    # remove special characters from user input
+    system_name = re.sub('[\\)\';=*+!^#% ]', '', usr_args)
+
+    #query epo server for os type
+    os_query = hostname + f"/core.executeQuery?target=EPOLeafNode&select=(select EPOComputerProperties.OSType  )&where=(where(eq EPOLeafNode.NodeName \"{system_name}\"))"
+    os_result = requests.get(os_query, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
+
+    # if query result returns only 'OK:' then machine was not found
+    if os_result.text.strip() == 'OK:':
+        response = "\n I could not find a machine with that name. \n The client may be broken, not managed by the production McAfee server, or the computer name is wrong."
+
+    os_string = os_result.text.replace(' ', '').lower() # modify os query result to facilitate string comparisons
+
+    if 'macos' in os_string:
+        mac_query_fields = [
+                            'AM_CustomProps.AVCMGRbComplianceStatus',
+                            'EPOLeafNode.NodeName',
+                            'EPOComputerProperties.OSType',
+                            'EPOLeafNode.LastUpdate',
+                            'AM_CustomProps.bAPEnabled',
+                            'AM_CustomProps.bOASEnabled',
+                            'EPOProdPropsView_EPOAGENT.productversion',
+                            'EPOProdPropsView_THREATPREVENTION.productversion',
+                            'AM_CustomProps.V2DATVersion'
+                            ]
+
+        query = hostname + f"/core.executeQuery?target=EPOLeafNode&select=(select {' '.join(mac_query_fields)})&where=(where(eq EPOLeafNode.NodeName \"{system_name}\"))"
+        query_result = requests.get(query, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
+        response = query_result.text
+        response = (response).replace("OK:", ":heavy_check_mark: :apple: *MacOS Client McAfee Products Up-To-Date* :heavy_check_mark:")
+
+    elif 'windows' in os_string:
+        win_query_fields = [
+                            'AM_CustomProps.AVCMGRbComplianceStatus',
+                            'EPOLeafNode.NodeName',
+                            'EPOComputerProperties.OSType',
+                            'EPOComputerProperties.OSBuildNum',
+                            'EPOLeafNode.LastUpdate',
+                            'AM_CustomProps.bAPEnabled',
+                            'AM_CustomProps.bOASEnabled',
+                            'EPOProdPropsView_EPOAGENT.productversion',
+                            'EPOProdPropsView_ENDPOINTSECURITYPLATFORM.productversion',
+                            'EPOProdPropsView_TIECLIENTMETA.productversion',
+                            'EPOProdPropsView_THREATPREVENTION.productversion',
+                            'EPOProdPropsView_WEBCONTROL.productversion',
+                            ]
+
+        query = hostname + f"/remote/core.executeQuery?target=EPOLeafNode&select=(select {' '.join(win_query_fields)})&where=(where(eq EPOLeafNode.NodeName \"{system_name}\"))"
+        query_result = requests.get(query, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
+
+        mcafee_up_to_date = True
+        response = query_result.text
+        system_mcafee_versions = re.findall(r"Product Version \((.*)\): ([.\d]*)", response)
+
+        for product, version in system_mcafee_versions:
+            pattern = f'Product Version \(({product})\):'
+
+            if mcafee_vers_dict['windows'][product] == version:
+                response = re.sub(pattern, r'\1 Version: ', response)
+            else:
+                mcafee_up_to_date = False
+                response = re.sub(pattern, r'*\1 Version: *', response)
+
+        if mcafee_up_to_date:
+            response = (response).replace("OK:", ":heavy_check_mark: :windows: *Windows Client McAfee Products Up-To-Date* :heavy_check_mark:")
+        else:
+            response = (response).replace("OK:", ":x: *Outdated Client McAfee Products Shown in Bold* :x:")
+
+        # convert microsoft os build number to version info
+        build_no = ''
+        match = re.search(r'Build Number: (\d*)', response)
+        if match:
+            try:
+                build_no = match.groups(0)[0]
+                version_info = vers_dict[build_no]
+                response = response.replace("OS Build Number", "OS Version")
+                response = response.replace(build_no, version_info)
+            except KeyError:
+                pass
+        
+
+    else:
+        query = hostname + '/core.executeQuery?target=EPOLeafNode&select=(select AM_CustomProps.AVCMGRbComplianceStatus EPOLeafNode.NodeName EPOComputerProperties.OSType EPOComputerProperties.OSBuildNum EPOLeafNode.LastUpdate AM_CustomProps.bAPEnabled AM_CustomProps.bOASEnabled EPOProdPropsView_EPOAGENT.productversion EPOProdPropsView_ENDPOINTSECURITYPLATFORM.productversion EPOProdPropsView_TIECLIENTMETA.productversion AM_CustomProps.ManifestVersion )&where=(where(eq+EPOLeafNode.NodeName "' + system_name + '"))'
+        query_result = requests.get(query, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
+        response = (query_result.text).replace("OK:", "")
 
     #Response editing for user readability
-    response = (query_result.text).replace("OK:", "")
-    response = response.replace("Managed State: 1", "Managed State: true")
-    response = response.replace("AMCore Content Compliance Status: 1", "AMCore Content Compliance Status: true")
+    response = response.replace("AMCore Content Compliance Status: 1", "Definitions Up To Date (AMCore Content): true")
+    response = response.replace("AMCore Content Compliance Status: 0", "Definitions Up To Date (AMCore Content): false")
+    response = response.replace("AMCore Content Compliance Status: null", "Definitions Up To Date (AMCore Content): unknown")
+    response = response.replace("Access Protection Enabled: null", "Access Protection Enabled: unknown")
+    response = response.replace("On-Access Scan Enabled: null", "On-Access Scan Enabled: unknown")
     
     if DEBUG == 1:
         print("\n run_namecheck - response user readability == DEBUG result output: \n" + response)
 
-    #operating system discrimination to apply proper method of health check verification 
-    if response.find("System Name:") == -1:
-        response = "Sorry, I could not find a machine with that name. The client may be broken, not managed by the production McAfee server, or the computer name is wrong."
-    if response.find("Mac OS X") != -1:
-        response = mac_healthchk(response)
-    else:
-        response = win_healthchk(response)
-    
+    #perform Multiple Infection history check
+    if(InfectionHistory(usr_args)):
+        response += "\n\n== WARNING! ==\n\n This machine has multiple major infections in the last 45days! \n== RE-IMAGE REQUIRED! ==\n"
     #send user final response
-    slack_client.api_call("chat.postMessage", channel=channel, text=response, as_user=True)
-def counter_SQLI(channel,usr_args):         #Protects run_namechk from invalid characters
-    panic = False
-    if usr_args.find("\"") != -1:
-        panic = True
-    if usr_args.find(")") != -1:
-        panic = True
-    if usr_args.find("'") != -1:
-        panic = True
-    if usr_args.find(";") != -1:
-        panic = True
-    if usr_args.find("=") != -1:
-         panic = True
-    if usr_args.find("*") != -1:
-        panic = True     
-    if usr_args.find("+") != -1:
-        panic = True
-    if usr_args.find("!") != -1:
-        panic = True
-    if usr_args.find("^") != -1:
-        panic = True
-    if usr_args.find("#") != -1:
-        panic = True
-    if usr_args.find(" ") != -1:
-        panic = True
-    if panic:
-        print("SQLI Detected at: " + time.strftime("%d/%m/%Y %H:%M") + " In Channel: " + channel)
-        print("Bad Query: " + usr_args)
-        print("Query Abandoned!")
-        
-        response = "SQLI Detected: Query Abandoned, This alert has been logged and the Administrator Notified!"
-        slack_client.api_call("chat.postMessage", channel=channel, text=response, as_user=True)
-    else:
-        run_namecheck(channel, usr_args)
+    webclient.chat_postMessage(channel=channel, text=response, as_user=True)
 
-command_dict = {                           #functions command dictionary
-    "help" : display_help,
+#Allows logging of events to error and audit logs
+def log_ToFile(message, level):
+
+    if DEBUG == 1:
+        print(message)
+        print(level)
+    logging_type_dict = {
+        "error" : ErrorFile,
+        "Error" : ErrorFile,
+        "Audit" : AuditFile,
+        "audit" : AuditFile,
+    }
+
+    current_file = open(logging_type_dict[level], 'a')
+    current_file.write(level + ": @" + "{:%B %d, %Y, %H:%M:%S}".format(datetime.now()) + " - " + message)
+    current_file.close()
+
+
+#functions command dictionary
+command_dict = {
     "?" : display_help,
-    "namecheck " : counter_SQLI,
+    "help" : display_help,
+    "Help" : display_help,
+    "namecheck " : run_namecheck,
+    "Namecheck " : run_namecheck,
 }
 
-if __name__ == "__main__":                  #Main BOT control
-    #BOT Startup Tasks
-    READ_WEBSOCKET_DELAY = 1
-    
+#Main BOT control
+if __name__ == "__main__":
     #check / verify McAfee ePO API credentials
+    hostname = ''
     try:
-        if ePO_SERVER_pass = "" == "" or ePO_SERVER_usr == "":
+        if CROMWELL_pass == "" or CROMWELL_usr == "":
             raise SystemExit(BOT_NAME + " FAILED to locate ePO API credentials; please provide credentails and try again")
             
-        url = ServerLocation + '/remote/core.help'
-        query_result = requests.get(url, auth=HTTPBasicAuth(ePO_SERVER_usr,ePO_SERVER_pass = ""), verify=False)
+        url = hostname + '/core.help'
+        query_result = requests.get(url, auth=HTTPBasicAuth(CROMWELL_usr,CROMWELL_pass), verify=False)
 
         if query_result.text.find("<title> - Error report</title>") != -1:
             if DEBUG == 1:
@@ -149,38 +280,12 @@ if __name__ == "__main__":                  #Main BOT control
             raise SystemExit("Connected to ePO API but failed to verify credentials; check credentials and restart")
     except:
         if DEBUG == 1:
-            print("\n Startup - Credential Check == DEBUG result output: \n" + query_result.text)
+            print("\n Startup - Credential Check FAILED")
         raise SystemExit(BOT_NAME + " FAILED to verify ePO API credentials; please check credentials & connection before trying again")
     
-    #Main Bot Operation
-    if slack_client.rtm_connect():  #Establish connection to slack.com
-        print(BOT_NAME + " is running and connected to slack.com")
-        
-        while True: #Slack Operating Loop
-            
-            #Search for commands
-            try:
-                command, channel = parse_slack_output(slack_client.rtm_read())
-            except:
-                print("Connection to slack.com FAILED... " + BOT_NAME + " could not perform slack_client.rtm_read()!")
-            #Process commands if found
-            if command and channel:
-
-                if DEBUG == 1:
-                    print(command)
-                    print(command[:MaxCommandLen])
-                    print(command[MaxCommandLen: MaxCommandLen+15])
-               
-                #Attempt to run users query
-                try:
-                    _thread.start_new_thread(command_dict[command[:MaxCommandLen]], (channel,  command[MaxCommandLen: MaxCommandLen+15]))
-                
-                except:
-                    response = "Sorry I am not familiar with that command, type help for more details"
-                    slack_client.api_call("chat.postMessage", channel=channel, text=response, as_user=True) 
-                
-            time.sleep(READ_WEBSOCKET_DELAY)
-    else: #Handle Connection Failure
-        print("Connection to slack.com FAILED... " + BOT_NAME + " could not establish connection!")
-        print("Check slack token and botID before restarting " + BOT_NAME + "!")
-        raise SystemExit()
+    try:
+        slack_client.start()
+    except RuntimeError as re:
+        log_ToFile(re, "Error")
+    except ValueError :
+        pass
